@@ -87,7 +87,8 @@ jobs:
     name: Deploy to Staging
     runs-on: ubuntu-latest
     needs: build-and-scan
-    environment: staging
+    environment:
+      name: staging
     if: github.ref == 'refs/heads/main'
     steps:
       - name: Deploy (placeholder)
@@ -98,8 +99,9 @@ jobs:
   deploy-production:
     name: Deploy to Production
     runs-on: ubuntu-latest
-    needs: deploy-staging
-    environment: production   # requires manual approval gate in GitHub Environments
+    needs: [build-and-scan, deploy-staging]
+    environment:
+      name: production    # requires manual approval gate in GitHub Environments
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production'
     steps:
       - name: Deploy (placeholder)

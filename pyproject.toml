@@ -35,3 +35,8 @@ ignore = ["S101"]   # allow assert in tests
 python_version = "3.11"
 strict = false
 ignore_missing_imports = true
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+reportUnusedFunction = "none"   # Flask decorators register by side-effect; inner functions appear unused to static analysis
