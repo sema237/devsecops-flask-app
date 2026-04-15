@@ -1,8 +1,10 @@
-name: Deploy
+name: Deploy Pipeline
+
 
 on:
   push:
-    branches: [main]
+    tags:
+      - 'v*'   # Only deploy on version tags (e.g. v1.2.3)
   workflow_dispatch:
     inputs:
       environment:
@@ -11,99 +13,225 @@ on:
         default: staging
         type: choice
         options: [staging, production]
+      tag:
+        description: Image tag to deploy (defaults to latest)
+        required: false
+
+
+permissions:
+  contents: read
+  id-token: write      # Required for Workload Identity Federation (keyless GCP auth)
+  security-events: write
+
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  REGION: us-central1
+  GAR_REPO: devsecops-repo
+  IMAGE_NAME: flask-app
+
 
 jobs:
-  build-and-scan:
-    name: Build & Scan Image
+  # ──────────────────────────────────────────
+  # Build, Scan, Sign and Push to Artifact Registry
+  # ──────────────────────────────────────────
+  build-push:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-      security-events: write
-
     outputs:
-      image: ${{ steps.meta.outputs.tags }}
-      digest: ${{ steps.push.outputs.digest }}
+      image-tag: ${{ steps.meta.outputs.tag }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Log in to GHCR
+      - name: Authenticate to Google Cloud (OIDC — no static keys)
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          token_format: access_token
+
+      - name: Login to Artifact Registry
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          registry: ${{ env.REGION }}-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
 
-      - name: Extract metadata
+      - name: Set image tag
         id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=sha,prefix=sha-
-            type=ref,event=branch
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+        run: |
+          REF=${{ github.ref_name }}
+          TAG=${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.GAR_REPO }}/${{ env.IMAGE_NAME }}:${REF}
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
 
-      - name: Build image
-        uses: docker/build-push-action@v5
+      - name: Build image locally for scanning
+        uses: docker/build-push-action@v6
         with:
           context: .
           push: false
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
           load: true
+          tags: ${{ steps.meta.outputs.tag }}
 
-      - name: Scan image with Trivy
+      - name: Trivy vulnerability scan (pre-push gate)
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          image-ref: ${{ steps.meta.outputs.tag }}
           format: sarif
           output: trivy-results.sarif
-          severity: HIGH,CRITICAL
-          exit-code: "1"
+          severity: CRITICAL,HIGH
+          exit-code: '1'   # Block push on critical/high findings
 
-      - name: Upload Trivy SARIF
-        if: always()
+      - name: Upload Trivy SARIF to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
+        if: always()
         with:
           sarif_file: trivy-results.sarif
           category: trivy
 
-      - name: Push image
-        id: push
-        uses: docker/build-push-action@v5
+      - name: Push to Artifact Registry
+        uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: |
+            ${{ steps.meta.outputs.tag }}
+            ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.GAR_REPO }}/${{ env.IMAGE_NAME }}:latest
 
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image with Cosign (keyless via OIDC)
+        run: cosign sign --yes ${{ steps.meta.outputs.tag }}
+
+  # ──────────────────────────────────────────
+  # Deploy to Cloud Run — Staging
+  # ──────────────────────────────────────────
   deploy-staging:
-    name: Deploy to Staging
+    needs: build-push
     runs-on: ubuntu-latest
-    needs: build-and-scan
     environment:
       name: staging
-    if: github.ref == 'refs/heads/main'
-    steps:
-      - name: Deploy (placeholder)
-        run: |
-          echo "Deploy ${{ needs.build-and-scan.outputs.image }} to staging"
-          # Replace with: gcloud run deploy / kubectl set image / etc.
+      url: https://staging.yourapp.com
 
-  deploy-production:
-    name: Deploy to Production
-    runs-on: ubuntu-latest
-    needs: [build-and-scan, deploy-staging]
-    environment:
-      name: production    # requires manual approval gate in GitHub Environments
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production'
     steps:
-      - name: Deploy (placeholder)
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud (Staging OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_STAGING }}
+          service_account: ${{ secrets.GCP_SA_STAGING }}
+
+      - name: Deploy to Cloud Run (Staging)
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: flask-app-staging
+          region: ${{ env.REGION }}
+          image: ${{ needs.build-push.outputs.image-tag }}
+          flags: >-
+            --allow-unauthenticated
+            --cpu=1
+            --memory=512Mi
+            --min-instances=0
+            --max-instances=5
+            --set-secrets=DATABASE_URL=db-url-staging:latest
+            --set-secrets=SECRET_KEY=secret-key-staging:latest
+            --vpc-connector=staging-vpc-connector
+
+      - name: Smoke Test
         run: |
-          echo "Deploy ${{ needs.build-and-scan.outputs.image }} to production"
+          URL=$(gcloud run services describe flask-app-staging \
+            --region=${{ env.REGION }} --format='value(status.url)')
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$URL/api/v1/health")
+          if [ "$STATUS" != "200" ]; then
+            echo "Health check failed with status $STATUS"
+            exit 1
+          fi
+          echo "Smoke test passed (HTTP $STATUS)"
+
+  # ──────────────────────────────────────────
+  # Deploy to Cloud Run — Production (Manual Approval Gate)
+  # ──────────────────────────────────────────
+  deploy-production:
+    needs: [build-push, deploy-staging]
+    runs-on: ubuntu-latest
+    environment:
+      name: production    # Manual approval required — configure in GitHub Environments
+      url: https://yourapp.com
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud (Production OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROD }}
+          service_account: ${{ secrets.GCP_SA_PROD }}
+
+      - name: Deploy to Cloud Run (Production)
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: flask-app-prod
+          region: ${{ env.REGION }}
+          image: ${{ needs.build-push.outputs.image-tag }}
+          flags: >-
+            --no-traffic
+            --cpu=2
+            --memory=1Gi
+            --min-instances=1
+            --max-instances=20
+            --set-secrets=DATABASE_URL=db-url-prod:latest
+            --set-secrets=SECRET_KEY=secret-key-prod:latest
+            --vpc-connector=prod-vpc-connector
+            --tag=v${{ github.ref_name }}
+
+      - name: Post-Deploy Verification
+        run: |
+          URL=$(gcloud run services describe flask-app-prod \
+            --region=${{ env.REGION }} --format='value(status.url)')
+          for i in 1 2 3 4 5; do
+            STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$URL/api/v1/health")
+            if [ "$STATUS" = "200" ]; then
+              echo "Health check passed on attempt $i"
+              exit 0
+            fi
+            echo "Attempt $i failed (HTTP $STATUS), retrying in 10s..."
+            sleep 10
+          done
+          echo "Deployment verification failed after 5 attempts"
+          exit 1
+
+      - name: Gradual Traffic Migration
+        run: |
+          SERVICE=flask-app-prod
+          TAG=v${{ github.ref_name }}
+
+          echo "Routing 10% traffic to $TAG..."
+          gcloud run services update-traffic $SERVICE \
+            --region=${{ env.REGION }} \
+            --to-tags=$TAG=10
+          sleep 60
+
+          echo "Routing 50% traffic to $TAG..."
+          gcloud run services update-traffic $SERVICE \
+            --region=${{ env.REGION }} \
+            --to-tags=$TAG=50
+          sleep 60
+
+          echo "Routing 100% traffic to $TAG..."
+          gcloud run services update-traffic $SERVICE \
+            --region=${{ env.REGION }} \
+            --to-tags=$TAG=100
+
+          echo "Traffic fully migrated to $TAG"
+
+      - name: Rollback on Failure
+        if: failure()
+        run: |
+          echo "Deployment failed — rolling back to previous revision..."
+          gcloud run services update-traffic flask-app-prod \
+            --region=${{ env.REGION }} \
+            --to-revisions=LATEST=0 \
+            --to-latest
+          echo "Rollback complete"
