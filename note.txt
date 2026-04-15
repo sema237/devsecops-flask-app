@@ -1,1 +1,15 @@
 Note taking
+The repo is now a GitHub template repository.                                                                                               
+                                                                                                                                                    
+  What this means:                                                                                                                                  
+  - Anyone (including you) can visit https://github.com/sema237/devsecops-flask-app and click "Use this template" to spin up a fresh repo with this 
+  exact structure — no fork history, clean git history.                                                                                             
+  - The template includes all the scaffolding: app/, tests/, .github/workflows/, terraform/, .semgrep/, Docker files, and config stubs.             
+                                                                                                                                                    
+  To use it later:                                                                                                                                  
+  gh repo create my-new-project --template sema237/devsecops-flask-app --clone                                                                      
+                                                                                                                                                    
+  Or via the GitHub UI: go to the repo → "Use this template" → "Create a new repository".                                                           
+                                                                                                                                                    
+  As you build out this course (CI/CD pipelines, Semgrep rules, Terraform configs, pre-commit hooks), all of that will be available to future       
+  projects through the template. 
