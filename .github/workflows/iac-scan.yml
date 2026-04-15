@@ -1,0 +1,53 @@
+name: IaC Scan
+
+on:
+  push:
+    paths:
+      - "terraform/**"
+      - "Dockerfile"
+      - "docker-compose.yml"
+  pull_request:
+    paths:
+      - "terraform/**"
+      - "Dockerfile"
+      - "docker-compose.yml"
+
+jobs:
+  dockerfile-lint:
+    name: Hadolint — Dockerfile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: warning
+
+  terraform-scan:
+    name: Checkov — Terraform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkov IaC scan
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: terraform/
+          framework: terraform
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+          soft_fail: true
+
+      - name: Upload SARIF to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov-results.sarif
+          category: checkov
+
+  compose-lint:
+    name: Validate docker-compose
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose config --quiet

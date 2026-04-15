@@ -1,0 +1,17 @@
+.git
+.github
+.env
+.env.*
+!.env.example
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.coverage
+coverage.xml
+tests/
+terraform/
+*.md
+.pre-commit-config.yaml
+pyproject.toml
+requirements-dev.txt
