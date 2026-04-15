@@ -1,18 +1,31 @@
-name: Security Monitor
+name: Scheduled Security Scan
+
 
 on:
   schedule:
-    - cron: "0 3 * * *"   # daily at 03:00 UTC
-  workflow_dispatch:
+    - cron: '0 6 * * *'   # Daily at 6 AM UTC
+  workflow_dispatch:        # Manual trigger
+
+
+permissions:
+  contents: read
+  id-token: write           # For Workload Identity Federation
+  issues: write             # For auto-opening GitHub issues on findings
+  security-events: write    # For SARIF uploads
+
+
+env:
+  REGION: us-central1
+  IMAGE: us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/devsecops-repo/flask-app:latest
+
 
 jobs:
-  cve-scan:
-    name: CVE Dependency Scan
+  # ──────────────────────────────────────────
+  # JOB 1: Dependency CVE Scan
+  # ──────────────────────────────────────────
+  dependency-scan:
+    name: Dependency CVE Scan
     runs-on: ubuntu-latest
-    permissions:
-      issues: write
-      contents: read
-
     steps:
       - uses: actions/checkout@v4
 
@@ -45,7 +58,9 @@ jobs:
 
             const body = vulns.map(d =>
               `### ${d.name}@${d.version}\n` +
-              d.vulns.map(v => `- **${v.id}**: ${v.description}\n  Fix: ${v.fix_versions?.join(', ') || 'no fix available'}`).join('\n')
+              d.vulns.map(v =>
+                `- **${v.id}**: ${v.description}\n  Fix: ${v.fix_versions?.join(', ') || 'no fix available'}`
+              ).join('\n')
             ).join('\n\n');
 
             await github.rest.issues.create({
@@ -56,8 +71,104 @@ jobs:
               labels: ['security', 'dependencies'],
             });
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload dependency audit results
+        uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: cve-scan-results
+          name: dependency-audit-results
           path: audit-results.json
+
+      - name: Notify Slack on dependency findings
+        if: failure() || steps.audit.outputs.found == 'true'
+        uses: slackapi/slack-github-action@v2
+        with:
+          webhook: ${{ secrets.SLACK_SECURITY_WEBHOOK }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": ":warning: *Dependency CVEs detected* in `${{ github.repository }}`.\nReview: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }
+
+  # ──────────────────────────────────────────
+  # JOB 2: Production Container Image Scan
+  # ──────────────────────────────────────────
+  image-scan:
+    name: Container Image Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev
+
+      - name: Pull production image
+        run: docker pull ${{ env.IMAGE }}
+
+      - name: Trivy — scan for latest CVEs
+        id: trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.IMAGE }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+
+      - name: Upload Trivy SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-nightly
+
+      - name: Upload Trivy results artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-image-results
+          path: trivy-results.sarif
+
+      - name: Notify Slack on image vulnerabilities
+        if: failure()
+        uses: slackapi/slack-github-action@v2
+        with:
+          webhook: ${{ secrets.SLACK_SECURITY_WEBHOOK }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": ":rotating_light: *SECURITY ALERT*: New CRITICAL/HIGH vulnerabilities found in the production image `flask-app:latest`.\nReview: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }
+
+  # ──────────────────────────────────────────
+  # JOB 3: Secret Detection (Full History)
+  # ──────────────────────────────────────────
+  secret-scan:
+    name: Secret Detection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # Full history — catch secrets added then removed
+
+      - name: Gitleaks secret scan
+        id: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Notify Slack on secret detection
+        if: failure()
+        uses: slackapi/slack-github-action@v2
+        with:
+          webhook: ${{ secrets.SLACK_SECURITY_WEBHOOK }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": ":key: *SECRET DETECTED* in `${{ github.repository }}` commit history.\nImmediate rotation required.\nReview: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }
